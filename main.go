@@ -1,12 +1,17 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/TwiN/go-choice"
 )
@@ -41,6 +46,29 @@ var aikarFlags = []string{
 	"-XX:SurvivorRatio=32",
 	"-XX:+PerfDisableSharedMem",
 	"-XX:MaxTenuringThreshold=1",
+}
+
+type progressWriter struct {
+	total      int64
+	downloaded int64
+	lastUpdate time.Time
+}
+
+func (pw *progressWriter) Write(p []byte) (int, error) {
+	n := len(p)
+	pw.downloaded += int64(n)
+
+	if time.Since(pw.lastUpdate) > 250*time.Millisecond || pw.downloaded == pw.total {
+		pw.lastUpdate = time.Now()
+		var percent float64
+		if pw.total > 0 {
+			percent = float64(pw.downloaded) / float64(pw.total) * 100
+			fmt.Printf("\rDownloading: %.1f%% (%d / %d MB)", percent, pw.downloaded/(1024*1024), pw.total/(1024*1024))
+		} else {
+			fmt.Printf("\rDownloading: %d MB", pw.downloaded/(1024*1024))
+		}
+	}
+	return n, nil
 }
 
 func loadConfig() (*Config, error) {
@@ -109,9 +137,402 @@ func getJarFiles(dir string) ([]string, error) {
 	return jars, nil
 }
 
+type PaperV3Project struct {
+	Versions map[string][]string `json:"versions"`
+}
+
+type PaperV3Version struct {
+	Builds []int `json:"builds"`
+}
+
+type PaperV3Build struct {
+	Downloads map[string]struct {
+		Name string `json:"name"`
+		URL  string `json:"url"`
+	} `json:"downloads"`
+}
+
+func fetchPaperVersions() ([]string, error) {
+	req, err := http.NewRequest("GET", "https://fill.papermc.io/v3/projects/paper", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "mcman/1.0")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var data PaperV3Project
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return nil, err
+	}
+
+	var versions []string
+	for _, verList := range data.Versions {
+		for _, v := range verList {
+			if !strings.Contains(v, "pre") && !strings.Contains(v, "rc") {
+				versions = append(versions, v)
+			}
+		}
+	}
+
+	if len(versions) == 0 {
+		return nil, fmt.Errorf("no stable versions found")
+	}
+
+	if len(versions) > 15 {
+		versions = versions[:15]
+	}
+
+	return versions, nil
+}
+
+func downloadPaperJar(version string, targetDir string) (string, error) {
+	client := &http.Client{Timeout: 15 * time.Second}
+
+	buildURL := fmt.Sprintf("https://fill.papermc.io/v3/projects/paper/versions/%s", version)
+	req, err := http.NewRequest("GET", buildURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "mcman/1.0")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	var vData PaperV3Version
+	if err := json.NewDecoder(resp.Body).Decode(&vData); err != nil {
+		return "", err
+	}
+
+	if len(vData.Builds) == 0 {
+		return "", fmt.Errorf("no builds found for version %s", version)
+	}
+
+	sort.Ints(vData.Builds)
+	latestBuild := vData.Builds[len(vData.Builds)-1]
+
+	detailURL := fmt.Sprintf("https://fill.papermc.io/v3/projects/paper/versions/%s/builds/%d", version, latestBuild)
+	req, err = http.NewRequest("GET", detailURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "mcman/1.0")
+
+	resp, err = client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	var bData PaperV3Build
+	if err := json.NewDecoder(resp.Body).Decode(&bData); err != nil {
+		return "", err
+	}
+
+	dl, ok := bData.Downloads["server:default"]
+	if !ok {
+		return "", fmt.Errorf("download asset not found in build info")
+	}
+
+	fileName := dl.Name
+	downloadURL := dl.URL
+
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		return "", err
+	}
+
+	outPath := filepath.Join(targetDir, fileName)
+	fmt.Printf("\nDownloading Paper %s (build %d)...\n", version, latestBuild)
+
+	dlReq, err := http.NewRequest("GET", downloadURL, nil)
+	if err != nil {
+		return "", err
+	}
+	dlReq.Header.Set("User-Agent", "mcman/1.0")
+
+	dlClient := &http.Client{Timeout: 5 * time.Minute}
+	dlResp, err := dlClient.Do(dlReq)
+	if err != nil {
+		return "", err
+	}
+	defer dlResp.Body.Close()
+
+	if dlResp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("download server returned status: %s", dlResp.Status)
+	}
+
+	outFile, err := os.Create(outPath)
+	if err != nil {
+		return "", err
+	}
+	defer outFile.Close()
+
+	pw := &progressWriter{total: dlResp.ContentLength}
+	if _, err := io.Copy(outFile, io.TeeReader(dlResp.Body, pw)); err != nil {
+		return "", err
+	}
+
+	fmt.Printf("\nSuccessfully saved to %s\n", outPath)
+	return fileName, nil
+}
+
+type PurpurProject struct {
+	Versions []string `json:"versions"`
+}
+
+func fetchPurpurVersions() ([]string, error) {
+	req, err := http.NewRequest("GET", "https://api.purpurmc.org/v2/purpur", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "mcman/1.0")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var data PurpurProject
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return nil, err
+	}
+
+	var rev []string
+	for i := len(data.Versions) - 1; i >= 0; i-- {
+		rev = append(rev, data.Versions[i])
+		if len(rev) >= 15 {
+			break
+		}
+	}
+	return rev, nil
+}
+
+func downloadPurpurJar(version string, targetDir string) (string, error) {
+	downloadURL := fmt.Sprintf("https://api.purpurmc.org/v2/purpur/%s/latest/download", version)
+
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		return "", err
+	}
+
+	fileName := fmt.Sprintf("purpur-%s.jar", version)
+	outPath := filepath.Join(targetDir, fileName)
+
+	fmt.Printf("\nDownloading Purpur %s (latest build)...\n", version)
+
+	req, err := http.NewRequest("GET", downloadURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "mcman/1.0")
+
+	dlClient := &http.Client{Timeout: 5 * time.Minute}
+	resp, err := dlClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("download server returned status: %s", resp.Status)
+	}
+
+	outFile, err := os.Create(outPath)
+	if err != nil {
+		return "", err
+	}
+	defer outFile.Close()
+
+	pw := &progressWriter{total: resp.ContentLength}
+	if _, err := io.Copy(outFile, io.TeeReader(resp.Body, pw)); err != nil {
+		return "", err
+	}
+
+	fmt.Printf("\nSuccessfully saved to %s\n", outPath)
+	return fileName, nil
+}
+
+func runJarInstaller(targetDir string) (string, error) {
+	serverTypes := []string{
+		"Paper (Fast, stable, standard)",
+		"Purpur (High-performance fork of Paper)",
+		"Cancel",
+	}
+
+	choiceType, _, err := gochoice.Pick("Select Server Type to Install:", serverTypes)
+	if err != nil || choiceType == "Cancel" {
+		return "", nil
+	}
+
+	if strings.HasPrefix(choiceType, "Paper") {
+		fmt.Println("Fetching available Paper versions...")
+		versions, err := fetchPaperVersions()
+		if err != nil {
+			return "", fmt.Errorf("failed to fetch Paper versions: %v", err)
+		}
+		versions = append(versions, "Cancel")
+
+		selectedVer, _, err := gochoice.Pick("Select Minecraft Version:", versions)
+		if err != nil || selectedVer == "Cancel" {
+			return "", nil
+		}
+
+		return downloadPaperJar(selectedVer, targetDir)
+	}
+
+	if strings.HasPrefix(choiceType, "Purpur") {
+		fmt.Println("Fetching available Purpur versions...")
+		versions, err := fetchPurpurVersions()
+		if err != nil {
+			return "", fmt.Errorf("failed to fetch Purpur versions: %v", err)
+		}
+		versions = append(versions, "Cancel")
+
+		selectedVer, _, err := gochoice.Pick("Select Minecraft Version:", versions)
+		if err != nil || selectedVer == "Cancel" {
+			return "", nil
+		}
+
+		return downloadPurpurJar(selectedVer, targetDir)
+	}
+
+	return "", nil
+}
+
+func runFirstTimeSetup() *Config {
+	fmt.Println("========================================")
+	fmt.Println("       Welcome to MCMAN Setup!          ")
+	fmt.Println("========================================")
+
+	setupOptions := []string{
+		"Download a brand new Minecraft Server JAR (Paper / Purpur)",
+		"Use an existing server directory on disk",
+		"Exit",
+	}
+
+	choiceOption, _, err := gochoice.Pick("How would you like to set up your server?", setupOptions)
+	if err != nil || choiceOption == "Exit" {
+		return nil
+	}
+
+	cfg := &Config{
+		ServerDir:  "./server",
+		JarFile:    "server.jar",
+		Ram:        "4G",
+		UseAikar:   true,
+		NoGUI:      true,
+		ExtraFlags: []string{},
+	}
+
+	if strings.HasPrefix(choiceOption, "Download") {
+		dirChoices := []string{
+			"./server (Standard server directory)",
+			"./ (Root project directory)",
+			"Custom Folder Name",
+		}
+		selectedDirChoice, _, err := gochoice.Pick("Where should the server files be located?", dirChoices)
+		if err != nil {
+			return nil
+		}
+
+		switch selectedDirChoice {
+		case "./server (Standard server directory)":
+			cfg.ServerDir = "./server"
+		case "./ (Root project directory)":
+			cfg.ServerDir = "."
+		case "Custom Folder Name":
+			fmt.Print("Enter custom directory path (e.g. ./myserver): ")
+			reader := bufio.NewReader(os.Stdin)
+			text, _ := reader.ReadString('\n')
+			text = strings.TrimSpace(text)
+			if text != "" {
+				cfg.ServerDir = text
+			} else {
+				cfg.ServerDir = "./server"
+			}
+		}
+
+		jarFile, err := runJarInstaller(cfg.ServerDir)
+		if err != nil {
+			fmt.Printf("[Error] Failed to install JAR: %v\n", err)
+			return nil
+		}
+		if jarFile == "" {
+			fmt.Println("[Manager] Setup aborted.")
+			return nil
+		}
+		cfg.JarFile = jarFile
+
+	} else {
+		dirs, err := getDirectories()
+		if err != nil || len(dirs) == 0 {
+			dirs = []string{"./ (Current Directory)", "./server"}
+		}
+		selectedDir, _, err := gochoice.Pick("Select server directory:", dirs)
+		if err != nil {
+			return nil
+		}
+		if selectedDir == "./ (Current Directory)" {
+			cfg.ServerDir = "."
+		} else {
+			cfg.ServerDir = selectedDir
+		}
+
+		jars, err := getJarFiles(cfg.ServerDir)
+		if err == nil && len(jars) > 0 {
+			selectedJar, _, err := gochoice.Pick("Select server JAR file:", jars)
+			if err == nil {
+				cfg.JarFile = selectedJar
+			}
+		} else {
+			fmt.Printf("No JAR files found in '%s'. Would you like to download one?\n", cfg.ServerDir)
+			dlOptions := []string{"Yes, download a server JAR", "No, I will place it manually"}
+			dlPick, _, _ := gochoice.Pick("Download JAR now?", dlOptions)
+			if strings.HasPrefix(dlPick, "Yes") {
+				jarFile, err := runJarInstaller(cfg.ServerDir)
+				if err == nil && jarFile != "" {
+					cfg.JarFile = jarFile
+				}
+			}
+		}
+	}
+
+	ramChoices := []string{"1G", "2G", "3G", "4G", "6G", "8G", "10G", "12G", "16G", "24G", "32G"}
+	selectedRam, _, err := gochoice.Pick("Select RAM allocation:", ramChoices)
+	if err == nil {
+		cfg.Ram = selectedRam
+	}
+
+	aikarChoices := []string{
+		"Yes - Enable Aikar's flags (Recommended for high performance)",
+		"No - Standard flags only",
+	}
+	aikarPick, _, err := gochoice.Pick("Enable Aikar's optimized JVM garbage collection flags?", aikarChoices)
+	if err == nil {
+		cfg.UseAikar = strings.HasPrefix(aikarPick, "Yes")
+	}
+
+	if err := saveConfig(cfg); err != nil {
+		fmt.Printf("[Error] Failed to save config: %v\n", err)
+	} else {
+		fmt.Println("[Manager] Configuration successfully saved to mcman.json")
+	}
+
+	return cfg
+}
+
 func runSetupMenu(current *Config) *Config {
 	cfg := &Config{
-		ServerDir:  ".",
+		ServerDir:  "./server",
 		JarFile:    "server.jar",
 		Ram:        "4G",
 		UseAikar:   true,
@@ -137,6 +558,7 @@ func runSetupMenu(current *Config) *Config {
 		options := []string{
 			fmt.Sprintf("Server Directory: %s", cfg.ServerDir),
 			fmt.Sprintf("Server JAR: %s", cfg.JarFile),
+			"Download / Install Server JAR (Paper / Purpur)",
 			fmt.Sprintf("RAM: %s", cfg.Ram),
 			fmt.Sprintf("Toggle Aikar Optimized JVM Flags (%s)", aikarStatus),
 			fmt.Sprintf("Toggle nogui Flag (%s)", guiStatus),
@@ -175,16 +597,23 @@ func runSetupMenu(current *Config) *Config {
 				cfg.JarFile = pickJar
 			}
 		case 2:
+			newJar, err := runJarInstaller(cfg.ServerDir)
+			if err != nil {
+				fmt.Printf("[Error] Jar installation failed: %v\n", err)
+			} else if newJar != "" {
+				cfg.JarFile = newJar
+			}
+		case 3:
 			ramChoices := []string{"1G", "2G", "3G", "4G", "6G", "8G", "10G", "12G", "16G", "24G", "32G"}
 			pickRam, _, err := gochoice.Pick("Select RAM allocation:", ramChoices)
 			if err == nil {
 				cfg.Ram = pickRam
 			}
-		case 3:
-			cfg.UseAikar = !cfg.UseAikar
 		case 4:
-			cfg.NoGUI = !cfg.NoGUI
+			cfg.UseAikar = !cfg.UseAikar
 		case 5:
+			cfg.NoGUI = !cfg.NoGUI
+		case 6:
 			if err := saveConfig(cfg); err != nil {
 				fmt.Printf("[Error] Failed to save config: %v\n", err)
 			} else {
@@ -256,8 +685,7 @@ func main() {
 	}
 
 	if cfg == nil {
-		fmt.Println("[Manager] No saved config found. Launching initial setup...")
-		cfg = runSetupMenu(nil)
+		cfg = runFirstTimeSetup()
 		if cfg == nil {
 			fmt.Println("[Manager] Setup cancelled. Exiting.")
 			os.Exit(0)
@@ -268,12 +696,13 @@ func main() {
 		startLabel := fmt.Sprintf("Start Server (%s / %s / %s)", cfg.ServerDir, cfg.JarFile, cfg.Ram)
 		options := []string{
 			startLabel,
-			"Setup & Flags Configuration",
+			"Download / Install Server JAR",
+			"Settings & Configuration",
 			"Exit",
 		}
 
 		selected, idx, err := gochoice.Pick("Minecraft Server Manager - Main Menu", options)
-		if err != nil || idx == 2 || selected == "Exit" {
+		if err != nil || idx == 3 || selected == "Exit" {
 			fmt.Println("Goodbye.")
 			break
 		}
@@ -282,6 +711,14 @@ func main() {
 		case 0:
 			runServer(cfg)
 		case 1:
+			newJar, err := runJarInstaller(cfg.ServerDir)
+			if err != nil {
+				fmt.Printf("[Error] Installation failed: %v\n", err)
+			} else if newJar != "" {
+				cfg.JarFile = newJar
+				_ = saveConfig(cfg)
+			}
+		case 2:
 			updatedCfg := runSetupMenu(cfg)
 			if updatedCfg != nil {
 				cfg = updatedCfg
